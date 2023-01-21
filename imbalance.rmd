@@ -1,0 +1,253 @@
+---
+title: "handling class imbalance in bird feeder observations"
+author: "chad allison"
+date: '2023-01-20'
+output: github_document
+---
+
+### setup
+
+```{r message = F, warning = F}
+library(tidyverse) # essential functions
+library(tidymodels) # essential for modeling
+library(themis) # downsampling
+library(vip) # variable importance
+theme_set(theme_minimal())
+```
+
+### importing data
+
+```{r}
+link = "https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2023/2023-01-10/PFW_count_site_data_public_2021.csv"
+
+site_data = read_csv(link, col_types = cols()) |>
+  mutate(squirrels = ifelse(squirrels == 1, "squirrels", "no squirrels"))
+
+glimpse(site_data)
+```
+
+### exploring counts of squirrel sightings
+
+```{r}
+site_data |>
+  count(squirrels) |>
+  ggplot(aes(squirrels, n)) +
+  geom_col(aes(fill = squirrels), alpha = 0.75) +
+  geom_text(aes(label = n), vjust = -0.5) +
+  scale_fill_manual(values = c("springgreen4", "indianred3")) +
+  labs(x = NULL, y = "count", fill = NULL,
+       title = "we have imbalanced classes") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "none")
+```
+
+### relationship between squirrel sightings and nearby feeders
+
+```{r}
+site_data |>
+  filter(!is.na(squirrels)) |>
+  group_by(squirrels) |>
+  summarise(nearby_feeders = round(mean(nearby_feeders, na.rm = T), 3))
+```
+
+### visualizing squirrel sightings among different habitats
+
+```{r}
+site_data |>
+  filter(!is.na(squirrels)) |>
+  group_by(squirrels) |>
+  summarise(across(contains("hab"), mean, na.rm = T)) |>
+  pivot_longer(contains("hab")) |>
+  mutate(name = str_remove(name, "hab_")) |>
+  ggplot(aes(value, fct_reorder(name, value))) +
+  geom_col(aes(fill = squirrels), position = "dodge", alpha = 0.75) +
+  scale_fill_manual(values = c("springgreen4", "indianred3")) +
+  labs(x = "percent of locations", y = "habitat name", fill = NULL)
+```
+
+### data splitting
+
+```{r}
+set.seed(123)
+
+feeder_split = site_data |>
+  filter(!is.na(squirrels)) |>
+  select(-loc_id, -proj_period_id, -fed_yr_round) |>
+  select(squirrels, everything()) |>
+  initial_split(stata = squirrels)
+
+feeder_train = training(feeder_split)
+feeder_test = testing(feeder_split)
+
+set.seed(234)
+
+feeder_folds = vfold_cv(feeder_train, strata = squirrels)
+feeder_folds
+```
+
+### creating model recipe (without downsampling)
+
+```{r}
+feeder_rec = recipe(squirrels ~ ., data = feeder_train) |>
+  step_impute_mean(all_numeric_predictors()) |>
+  step_nzv(all_numeric_predictors())
+
+feeder_rec
+```
+
+### creating model specification
+
+```{r}
+glmnet_spec = logistic_reg(penalty = tune(), mixture = 1) |>
+  set_engine("glmnet")
+
+glmnet_spec
+```
+
+### creating workflow set with downsampling specification
+
+```{r}
+wf_set = workflow_set(list(basic = feeder_rec,
+                           downsampling = step_downsample(feeder_rec, squirrels)),
+                      list(glmnet = glmnet_spec))
+
+wf_set
+```
+
+### mapping the workflow set
+
+```{r}
+narrower_penalty = penalty(range = c(-3, 0))
+doParallel::registerDoParallel()
+set.seed(345)
+
+tune_rs = workflow_map(wf_set, "tune_grid", resamples = feeder_folds,
+                       grid = 15, metrics = metric_set(accuracy, roc_auc, mn_log_loss,
+                                                       sensitivity, specificity),
+                       param_info = parameters(narrower_penalty))
+
+tune_rs
+```
+
+### visualizing results
+
+```{r}
+autoplot(tune_rs) +
+  theme(legend.position = "none")
+```
+
+### evaluating best models
+
+```{r}
+rank_results(tune_rs, rank_metric = "mn_log_loss")
+```
+
+### visualizing downsampling results
+
+```{r}
+downsample_rs = tune_rs |>
+  extract_workflow_set_result("downsampling_glmnet")
+
+autoplot(downsample_rs)
+```
+
+### selecting most general model without too big a penalty
+
+```{r}
+best_penalty = downsample_rs |>
+  select_by_one_std_err(-penalty, metric = "mn_log_loss")
+
+best_penalty
+```
+
+### updating workflow with our "best penalty"
+
+```{r}
+final_fit = wf_set |>
+  extract_workflow("downsampling_glmnet") |>
+  finalize_workflow(best_penalty) |>
+  last_fit(feeder_split)
+
+final_fit
+```
+
+### collecting model metrics
+
+```{r}
+collect_metrics(final_fit)
+```
+
+### confusion matrix
+
+```{r}
+collect_predictions(final_fit) |>
+  conf_mat(squirrels, .pred_class) |>
+  autoplot(type = "heatmap")
+```
+
+### variable importance
+
+```{r}
+extract_fit_engine(final_fit) |>
+  vi() |>
+  mutate(Importance = round(Importance, 3)) |>
+  group_by(Sign) |>
+  slice_max(Importance, n = 15) |>
+  ungroup() |>
+  ggplot(aes(Importance, fct_reorder(Variable, Importance))) +
+  geom_col(aes(fill = Sign), alpha = 0.75) +
+  scale_fill_manual(values = c("indianred3", "springgreen4")) +
+  facet_wrap(vars(Sign), scale = "free_y") +
+  labs(y = NULL, fill = NULL, title = "variable importance") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
